@@ -2,8 +2,11 @@ import pandas as pd
 from branca.element import MacroElement, Template
 
 
-def street_view_url(lat: float, lon: float) -> str:
-    return f"https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={lat},{lon}"
+def street_view_url(lat, lon, heading=0, pitch=0, fov=90):
+    return (
+        f"https://www.google.com/maps/@?api=1&map_action=pano"
+        f"&viewpoint={lat},{lon}&heading={heading}&pitch={pitch}&fov={fov}"
+    )
 
 
 def get_color(val: float) -> str:
