@@ -1,3 +1,4 @@
 *gzip
+*.csv
 
 __pycache__/
