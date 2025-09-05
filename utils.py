@@ -19,7 +19,7 @@ def get_color(val: float) -> str:
         return "green"
 
     if val >= 0:
-        if abs_val < 0.1:
+        if abs_val < 0.095:
             return "yellow"
         elif abs_val > 0.15:
             return "red"
@@ -66,5 +66,5 @@ def add_misplacement_legend(m) -> None:
 
 def get_img_path(row: pd.Series, camera: str = "FWD", rig: str = "rig-front-uf") -> str:
     camera_filed = f"{camera}_HUSE"
-    img_path = f"http://10.10.10.100:8173//{camera}/{rig}/{row["ts"].strftime("%Y/%m/%d/%H")}/{row[camera_filed]}"
+    img_path = f"http://10.10.10.100:8173//{camera}/{rig}/{row['ts'].strftime('%Y/%m/%d/%H')}/{row[camera_filed]}"
     return img_path

@@ -12,22 +12,19 @@ from streamlit_folium import st_folium
 from utils import *
 
 st.set_page_config(page_title="Poles map", layout="wide")
-st.title("📍 Poles by Hour — Folium in Streamlit")
+st.title("📍 Inclination QC")
 
 POPUP_W = 520
 IMG_MAX_H = 320
 REQUIRED_COLS: List[str] = [
-    "lat", "lon", "ts", "fwd_path", "pole_id", "segment_id",
-    "rail_incl_smoothed", "misplacement_smoothed", "pole_incl_right",
+    "lat", "lon", "ts", "fwd_path", "pole_id",
+    "rail_incl_corrected", "misplacement",
+    "rail_top_amsl", "asphalt_amsl", "shoulder_amsl", 
 ]
 
-EDITABLE_COLS = ["rail_incl_smoothed", "misplacement_smoothed", "pole_incl_right"]
+EDITABLE_COLS = ["rail_incl_corrected", "misplacement"] #["rail_incl_smoothed", "misplacement_smoothed", "pole_incl_right"]
 
-def street_view_url(lat, lon, heading=0, pitch=0, fov=90):
-    return (
-        f"https://www.google.com/maps/@?api=1&map_action=pano"
-        f"&viewpoint={lat},{lon}&heading={heading}&pitch={pitch}&fov={fov}"
-    )
+
 
 @st.cache_data(show_spinner=True)
 def load_data(name: str, data_bytes: bytes) -> pd.DataFrame:
@@ -51,18 +48,11 @@ def load_data(name: str, data_bytes: bytes) -> pd.DataFrame:
         raise ValueError(f"Missing required columns: {missing}")
 
     df = df[REQUIRED_COLS].copy()
-
-    for c in ["lat", "lon", "rail_incl_smoothed", "misplacement_smoothed", "pole_incl_right"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce", downcast="float")
-    for c in ["pole_id", "segment_id", "fwd_path"]:
-        df[c] = df[c].astype("category")
-
-    if not pd.api.types.is_datetime64_any_dtype(df["ts"]):
-        df["ts"] = pd.to_datetime(df["ts"], errors="coerce", utc=True)
     df["hour"] = df["ts"].dt.hour.astype("Int8")
+    # Replace your two lines with these two:
+    df = df.reset_index(drop=True)           
+    df["row_id"] = df.index.astype("Int64")  
 
-    df = df.reset_index(drop=False).rename(columns={"index": "row_id"})
-    df["row_id"] = df["row_id"].astype("Int64")
 
     def _fmt(v, fmt):
         try:
@@ -70,11 +60,7 @@ def load_data(name: str, data_bytes: bytes) -> pd.DataFrame:
         except Exception:
             return "—"
 
-    df["rail_txt"] = df["rail_incl_smoothed"].apply(lambda v: _fmt(v, "{:.0f}°"))
-    df["misp_txt"] = df["misplacement_smoothed"].apply(lambda v: _fmt(v, "{:.2f}"))
-    df["pole_txt"] = df["pole_incl_right"].apply(lambda v: _fmt(v, "{:.2f}"))
-
-    df["color"] = df["misplacement_smoothed"].apply(lambda v: get_color(v))
+    df["color"] = df["misplacement"].apply(lambda v: get_color(v))
     return df
 
 uploaded = st.file_uploader(
@@ -83,8 +69,8 @@ uploaded = st.file_uploader(
 )
 if not uploaded:
     st.info(
-        "Upload a file with at least: lat, lon, ts, fwd_path, pole_id, segment_id, "
-        "rail_incl_smoothed, misplacement_smoothed, pole_incl_right."
+        "Upload a file with at least: lat, lon, ts, fwd_path, pole_id, " # segment_id, "
+        "rail_incl_corrected, misplacement. " #pole_incl_right."
     )
     st.stop()
 
@@ -94,8 +80,6 @@ except Exception as e:
     st.error(str(e))
     st.stop()
 
-st.caption(f"Loaded **{len(df):,}** rows • approx memory: "
-           f"**{df.memory_usage(deep=True).sum()/1e6:.1f} MB**")
 
 if "edits" not in st.session_state:
     st.session_state.edits = []  # list of dicts
@@ -142,11 +126,13 @@ def build_popup(row) -> folium.Popup:
     html = (
         f"<div style='font-size:16px; line-height:1.35;' data-rowid='{int(row.get('row_id'))}'>"
         f"  <div><strong>Row ID:</strong> {int(row.get('row_id'))}</div>"
-        f"  <div><strong>Pole id:</strong> {row.get('pole_id')}</div>"
-        f"  <div><strong>Segment_id:</strong> {row.get('segment_id')}</div>"
-        f"  <div><strong>Rail inclination:</strong> {row.get('rail_txt')}</div>"
-        f"  <div><strong>Misplacement:</strong> {row.get('misp_txt')}</div>"
-        f"  <div><strong>Pole incl right:</strong> {row.get('pole_txt')}</div>"
+        f"  <div><strong>Pole id:</strong> {row['pole_id']}</div>"
+      #  f"  <div><strong>Segment_id:</strong> {row.get('segment_id')}</div>"
+        f"  <div><strong>Rail inclination:</strong> {row['rail_incl_corrected']:.0f}°</div>"
+        f"  <div><strong>Misplacement:</strong> {row['misplacement']:.2f} m</div>"
+       # f"  <div><strong>Pole incl right:</strong> {row.get('pole_txt')}</div>"
+        f"  <div><strong>Asphalt height:</strong> {(row['rail_top_amsl'] - row['asphalt_amsl']):.2f}</div>"
+        f"  <div><strong>Shoulder height:</strong> {(row['rail_top_amsl'] - row['shoulder_amsl']):.2f}</div>"
         f"  <div style='margin-top:6px;'><a href='{sv_url}' target='_blank' style='font-weight:600;'>Street View</a></div>"
         f"  {img_html}"
         f"</div>"
@@ -188,7 +174,7 @@ else:
         location=center,
         zoom_start=zoom_start,
         control_scale=True,
-        prefer_canvas=True,        # smoother with many points
+        prefer_canvas=True,       
         tiles="CartoDB Positron",  # light basemap
     )
     make_intro_marker(fmap, center)
@@ -198,7 +184,7 @@ else:
     out = st_folium(
         fmap,
         height=720,
-        use_container_width=True,                 # (streamlit-folium param is fine)
+        use_container_width=True,                
         key="points_map",
         returned_objects=["last_object_clicked_popup"],  # only clicks trigger a rerun
     )
@@ -214,31 +200,57 @@ st.subheader("✏️ Edit selected measurement (writes to diff file, original da
 col_sel, col_info = st.columns([1, 2], vertical_alignment="top")
 
 with col_sel:
-    selected_row_id = st.number_input(
-        "Row ID",
-        min_value=0,
-        value=int(st.session_state.selected_row_id) if st.session_state.selected_row_id is not None else 0,
-        step=1,
-        help="Click a marker to auto-fill. Or type a Row ID."
+    min_id = int(df["row_id"].min())
+    max_id = int(df["row_id"].max())
+    default_start = int(st.session_state.selected_row_id) if st.session_state.selected_row_id is not None else min_id
+
+    start_id = st.number_input(
+        "Start Row ID",
+        min_value=min_id, max_value=max_id,
+        value=default_start, step=1,
+        help="Click a marker to fill this, or type manually.",
+        key="row_start",
     )
-    row_exists = selected_row_id in df["row_id"].values
+    end_id = st.number_input(
+        "End Row ID (inclusive)",
+        min_value=min_id, max_value=max_id,
+        value=int(start_id), step=1,
+        help="Use the same as Start to edit a single row.",
+        key="row_end",
+    )
+
+    # Normalize range, build target ids that actually exist
+    s, e = int(start_id), int(end_id)
+    if e < s:
+        s, e = e, s
+    all_ids = set(df["row_id"].astype(int).tolist())
+    target_ids = [rid for rid in range(s, e + 1) if rid in all_ids]
+
+    row_exists = len(target_ids) > 0
 
 with col_info:
     if not row_exists:
-        st.info("Select a valid Row ID by clicking a marker on the map, or enter one manually.")
+        st.info("No valid rows in the selected range. Adjust Start/End.")
+        row_for_preview = None
     else:
-        row = df.loc[df["row_id"] == selected_row_id].iloc[0]
-        st.markdown(
-            f"**Pole:** `{row['pole_id']}` &nbsp;&nbsp; **Segment:** `{row['segment_id']}` &nbsp;&nbsp; "
-            f"**Lat/Lon:** {row['lat']:.6f}, {row['lon']:.6f} &nbsp;&nbsp; **Hour:** {int(row['hour']) if pd.notna(row['hour']) else '—'}"
-        )
-        st.markdown("**Current values:** "
-                    f"Rail incl: `{row['rail_incl_smoothed']}` &nbsp;&nbsp; "
-                    f"Misplacement: `{row['misplacement_smoothed']}` &nbsp;&nbsp; "
-                    f"Pole incl right: `{row['pole_incl_right']}`")
+        if len(target_ids) == 1:
+            row_for_preview = df.loc[df["row_id"] == target_ids[0]].iloc[0]
+            st.markdown(
+                f"**Pole:** `{row_for_preview['pole_id']}` &nbsp;&nbsp; "
+                f"**Lat/Lon:** {row_for_preview['lat']:.6f}, {row_for_preview['lon']:.6f} &nbsp;&nbsp; "
+                f"**Hour:** {int(row_for_preview['hour']) if pd.notna(row_for_preview['hour']) else '—'}"
+            )
+            st.markdown("**Current values:** "
+                        f"Rail incl (corr): `{row_for_preview['rail_incl_corrected']}` &nbsp;&nbsp; "
+                        f"Misplacement: `{row_for_preview['misplacement']}`")
+        else:
+            row_for_preview = None
+            st.markdown(
+                f"**Range selected:** **{s}–{e}** → **{len(target_ids)}** rows will be updated."
+            )
 
         with st.form(key="edit_form", clear_on_submit=False):
-            st.write("Set new values (leave blank to skip). Check 'NaN' to clear a value.")
+            st.write("Set new values (leave blank to skip). Check 'NaN' to clear a value for all rows in range.")
             new_vals = {}
             for col in EDITABLE_COLS:
                 c1, c2 = st.columns([3, 1])
@@ -254,23 +266,27 @@ with col_info:
                     except ValueError:
                         st.warning(f"Could not parse number for {col}; change for that field ignored.")
 
-            submitted = st.form_submit_button("Add change to diff", key="submit_edit")
+            submitted = st.form_submit_button("Add change(s) to diff", key="submit_edit")
             if submitted:
-                if not any(k in new_vals for k in EDITABLE_COLS):
+                if len(target_ids) == 0:
+                    st.info("No valid rows in the selected range.")
+                elif not any(k in new_vals for k in EDITABLE_COLS):
                     st.info("No changes provided.")
                 else:
                     ts = pd.Timestamp.utcnow().isoformat()
-                    for col, val in new_vals.items():
-                        if col in EDITABLE_COLS and (val is None or isinstance(val, float)):
-                            st.session_state.edits.append({
-                                "row_id": int(selected_row_id),
-                                "pole_id": str(row["pole_id"]),
-                                "segment_id": str(row["segment_id"]),
-                                "column": col,
-                                "new_value": None if val is None else float(val),
-                                "timestamp_utc": ts,
-                            })
-                    st.success("Change(s) queued in diff buffer below. Use Download to save to file.")
+                    for rid in target_ids:
+                        row_i = df.loc[df["row_id"] == rid].iloc[0]
+                        for col, val in new_vals.items():
+                            if col in EDITABLE_COLS and (val is None or isinstance(val, float)):
+                                st.session_state.edits.append({
+                                    "row_id": int(rid),
+                                    "pole_id": str(row_i["pole_id"]),
+                                    "column": col,
+                                    "new_value": None if val is None else float(val),
+                                    "timestamp_utc": ts,
+                                })
+                    st.success(f"Queued changes for **{len(target_ids)}** row(s). Use Download to save to file.")
+
 
 # ----- Diff review & download -----
 st.divider()
