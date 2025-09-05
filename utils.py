@@ -1,3 +1,5 @@
+import re
+
 import pandas as pd
 from branca.element import MacroElement, Template
 
@@ -32,6 +34,58 @@ def get_color(val: float) -> str:
             return "purple"  # e.g., "#800080"
         else:
             return "blue"  # e.g., "#0000FF"
+
+def hex_to_rgb_list(c: str):
+    """Accepts CSS color names (e.g. 'green'), #RRGGBB / #RGB hex, or 'rgb(r,g,b)'.
+    Returns [R, G, B]. Falls back to gray."""
+    NAMED = {
+        "gray": [128, 128, 128],
+        "green": [0, 128, 0],
+        "yellow": [255, 255, 0],
+        "orange": [255, 165, 0],
+        "lightblue": [173, 216, 230],
+        "purple": [128, 0, 128],
+        "blue": [0, 0, 255],
+        "red": [255, 0, 0],
+        "black": [0, 0, 0],
+        "white": [255, 255, 255],
+    }
+
+    # handle NaN / None
+    try:
+        if c is None or (isinstance(c, float) and pd.isna(c)):
+            return NAMED["gray"]
+    except Exception:
+        pass
+
+    s = str(c).strip().lower()
+    if not s:
+        return NAMED["gray"]
+
+    # CSS named color
+    if s in NAMED:
+        return NAMED[s]
+
+    # rgb(r,g,b)
+    m = re.match(r"rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})", s)
+    if m:
+        r, g, b = (int(m.group(i)) for i in (1, 2, 3))
+        clamp = lambda x: max(0, min(255, x))
+        return [clamp(r), clamp(g), clamp(b)]
+
+    # hex #RGB or #RRGGBB
+    if s.startswith("#"):
+        s = s[1:]
+    if len(s) == 3:
+        s = "".join(ch * 2 for ch in s)  # expand #abc -> #aabbcc
+    if len(s) == 6:
+        try:
+            return [int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)]
+        except Exception:
+            pass
+
+    # fallback
+    return NAMED["gray"]
 
 
 def add_misplacement_legend(m) -> None:

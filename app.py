@@ -1,29 +1,33 @@
 import io
 import json
-import re
-from typing import List, Optional, Tuple
+from typing import List
 
-import folium
 import pandas as pd
+import pydeck as pdk
 import streamlit as st
-from folium.plugins import MarkerCluster
-from streamlit_folium import st_folium
 
 from utils import *
 
 st.set_page_config(page_title="Poles map", layout="wide")
 st.title("📍 Inclination QC")
 
-POPUP_W = 520
-IMG_MAX_H = 320
+pdk.settings.map_provider = "carto"
+pdk.settings.map_style = "light"
+
+POPUP_W = 400
+IMG_MAX_H = 300
 REQUIRED_COLS: List[str] = [
     "lat", "lon", "ts", "fwd_path", "pole_id",
     "rail_incl_corrected", "misplacement",
-    "rail_top_amsl", "asphalt_amsl", "shoulder_amsl", 
+    "rail_top_amsl", "asphalt_amsl", "shoulder_amsl",
 ]
+EDITABLE_COLS = ["rail_incl_corrected", "misplacement"]
 
-EDITABLE_COLS = ["rail_incl_corrected", "misplacement"] #["rail_incl_smoothed", "misplacement_smoothed", "pole_incl_right"]
-
+# ---------------------- Session state ----------------------
+if "edits" not in st.session_state:
+    st.session_state.edits = []
+if "selected_row_id" not in st.session_state:
+    st.session_state.selected_row_id = None
 
 
 @st.cache_data(show_spinner=True)
@@ -48,30 +52,29 @@ def load_data(name: str, data_bytes: bytes) -> pd.DataFrame:
         raise ValueError(f"Missing required columns: {missing}")
 
     df = df[REQUIRED_COLS].copy()
+
+    # Ensure ts is datetime
+    if not pd.api.types.is_datetime64_any_dtype(df["ts"]):
+        with pd.option_context("mode.chained_assignment", None):
+            df["ts"] = pd.to_datetime(df["ts"], errors="coerce", utc=True)
+
     df["hour"] = df["ts"].dt.hour.astype("Int8")
-    # Replace your two lines with these two:
-    df = df.reset_index(drop=True)           
-    df["row_id"] = df.index.astype("Int64")  
+    df = df.reset_index(drop=True)
+    df["row_id"] = df.index.astype("Int64")
 
+    # Color → hex via your util, then to RGB for pydeck
+    df["color_hex"] = df["misplacement"].apply(lambda v: get_color(v))
+    df["rgb"] = df["color_hex"].apply(hex_to_rgb_list)
 
-    def _fmt(v, fmt):
-        try:
-            return fmt.format(v) if pd.notna(v) else "—"
-        except Exception:
-            return "—"
-
-    df["color"] = df["misplacement"].apply(lambda v: get_color(v))
     return df
 
+# ---------------------- Upload ----------------------
 uploaded = st.file_uploader(
     "Upload merged dataframe (Parquet or CSV)",
     type=["parquet","parq","pq","parquet.gz","parq.gz","pq.gz","parquet.gzip","csv","csv.gz"],
 )
 if not uploaded:
-    st.info(
-        "Upload a file with at least: lat, lon, ts, fwd_path, pole_id, " # segment_id, "
-        "rail_incl_corrected, misplacement. " #pole_incl_right."
-    )
+    st.info("Upload a file with at least: lat, lon, ts, fwd_path, pole_id, rail_incl_corrected, misplacement.")
     st.stop()
 
 try:
@@ -80,135 +83,166 @@ except Exception as e:
     st.error(str(e))
     st.stop()
 
-
-if "edits" not in st.session_state:
-    st.session_state.edits = []  # list of dicts
-if "selected_row_id" not in st.session_state:
-    st.session_state.selected_row_id = None
-
+# ---------------------- Sidebar filters ----------------------
 hours_present = sorted([int(h) for h in df["hour"].dropna().unique().tolist()])
 default_hours = [h for h in hours_present if 5 <= h <= 15] or hours_present
 
 with st.sidebar:
-    st.header("Filters & Performance")
+    st.header("Filters & Rendering")
     sel_hours = st.multiselect("Hours (local to `ts`)", options=hours_present, default=default_hours)
-    MAX_POINTS = st.slider("Max points to render", 500, 20000, 2000, step=500)  # slightly lower default for smoothness
     zoom_start = st.slider("Initial zoom", 6, 18, 12)
+    show_img = st.checkbox("Show forward image in tooltip", value=True,
+                           help="Disable if hovering becomes heavy on slow networks.")
 
 subset = df[df["hour"].isin(sel_hours)] if sel_hours else df
 
-def make_intro_marker(fmap: folium.Map, center: Tuple[float, float]):
-    folium.Marker(
-        location=center,
-        icon=folium.Icon(color="blue", icon="info-sign"),
-        popup=folium.Popup(
-            "Click a circle to select a row for editing below.",
-            max_width=280,
-        ),
-    ).add_to(fmap)
-
-def build_popup(row) -> folium.Popup:
-    sv_url = street_view_url(row["lat"], row["lon"])
-    fwd_url = row.get("fwd_path")
-    has_fwd = pd.notna(fwd_url) and str(fwd_url).strip() != ""
-
-    # Always embed forward image in popup (or show a placeholder note)
-    if has_fwd:
-        img_html = (
-            f"<div style='margin-top:6px'>"
-            f"  <img src='{fwd_url}' style='width:100%;max-height:{IMG_MAX_H}px;object-fit:contain;"
-            f"  border:1px solid #ccc;border-radius:6px' loading='lazy'/>"
-            f"</div>"
-        )
-    else:
-        img_html = "<div style='margin-top:6px;color:#888;'>No forward image available</div>"
-
-    html = (
-        f"<div style='font-size:16px; line-height:1.35;' data-rowid='{int(row.get('row_id'))}'>"
-        f"  <div><strong>Row ID:</strong> {int(row.get('row_id'))}</div>"
-        f"  <div><strong>Pole id:</strong> {row['pole_id']}</div>"
-      #  f"  <div><strong>Segment_id:</strong> {row.get('segment_id')}</div>"
-        f"  <div><strong>Rail inclination:</strong> {row['rail_incl_corrected']:.0f}°</div>"
-        f"  <div><strong>Misplacement:</strong> {row['misplacement']:.2f} m</div>"
-       # f"  <div><strong>Pole incl right:</strong> {row.get('pole_txt')}</div>"
-        f"  <div><strong>Asphalt height:</strong> {(row['rail_top_amsl'] - row['asphalt_amsl']):.2f}</div>"
-        f"  <div><strong>Shoulder height:</strong> {(row['rail_top_amsl'] - row['shoulder_amsl']):.2f}</div>"
-        f"  <div style='margin-top:6px;'><a href='{sv_url}' target='_blank' style='font-weight:600;'>Street View</a></div>"
-        f"  {img_html}"
-        f"</div>"
-    )
-    return folium.Popup(html, max_width=POPUP_W, min_width=POPUP_W)
-
-def add_points_with_cluster(fmap: folium.Map, data: pd.DataFrame, cap: int):
-    cluster = MarkerCluster(disableClusteringAtZoom=16, spiderfyOnMaxZoom=True)
-    cluster.add_to(fmap)
-
-    if len(data) > cap:
-        data = data.sample(cap, random_state=0)
-
-    for _, row in data.iterrows():
-        folium.CircleMarker(
-            location=[row["lat"], row["lon"]],
-            radius=4,         
-            fill=True,
-            color=row["color"],
-            opacity=0,          # no stroke for faster paint
-            weight=0,           # no stroke width
-            fill_opacity=0.55,
-            popup=build_popup(row),
-        ).add_to(cluster)
-
-def extract_row_id_from_popup(popup_html: Optional[str]) -> Optional[int]:
-    """Reads data-rowid="<id>" from popup html."""
-    if not popup_html:
-        return None
-    m = re.search(r'data-rowid=[\'"](\d+)[\'"]', str(popup_html))
-    return int(m.group(1)) if m else None
-
-# ----- Map render -----
-if subset.empty:
-    st.warning("No rows match the selected hours.")
-else:
-    center = [subset["lat"].mean(), subset["lon"].mean()]
-    fmap = folium.Map(
-        location=center,
-        zoom_start=zoom_start,
-        control_scale=True,
-        prefer_canvas=True,       
-        tiles="CartoDB Positron",  # light basemap
-    )
-    make_intro_marker(fmap, center)
-    add_points_with_cluster(fmap, subset, MAX_POINTS)
-    folium.LayerControl(collapsed=False).add_to(fmap)
-
-    out = st_folium(
-        fmap,
-        height=720,
-        use_container_width=True,                
-        key="points_map",
-        returned_objects=["last_object_clicked_popup"],  # only clicks trigger a rerun
+with st.sidebar:
+    st.subheader("Render row range")
+    if subset.empty:
+        st.info("No rows for the selected hours.")
+        st.stop()
+    render_min = int(subset["row_id"].min())
+    render_max = int(subset["row_id"].max())
+    render_start, render_end = st.slider(
+        "Row IDs (inclusive)",
+        min_value=render_min,
+        max_value=render_max,
+        value=(render_min, render_max),
+        step=1,
+        help="Only points whose row_id is within this range will be drawn.",
+        key="render_range",
     )
 
-    clicked_popup = out.get("last_object_clicked_popup") if out else None
-    rid = extract_row_id_from_popup(clicked_popup)
-    if rid is not None:
-        st.session_state.selected_row_id = rid
+# Final slice to render
+to_render = subset[(subset["row_id"] >= render_start) & (subset["row_id"] <= render_end)].copy()
 
-# ----- Editing panel -----
+if to_render.empty:
+    st.warning("No rows match the selected hours and row range.")
+    st.stop()
+
+# Add derived fields used by tooltip (avoid heavy formatting in HTML)
+to_render["mispl_str"] = to_render["misplacement"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
+to_render["rail_incl_str"] = to_render["rail_incl_corrected"].map(lambda x: f"{x:.0f}" if pd.notna(x) else "—")
+to_render["sv_url"] = to_render.apply(lambda r: street_view_url(r["lat"], r["lon"]), axis=1)
+
+# ---------------------- pydeck map ----------------------
+center_lat = float(to_render["lat"].mean())
+center_lon = float(to_render["lon"].mean())
+
+view_state = pdk.ViewState(
+    latitude=center_lat,
+    longitude=center_lon,
+    zoom=float(zoom_start),
+    pitch=0,
+    bearing=0,
+)
+
+st.markdown("""
+<style>
+  /* Let tooltip capture clicks and sit above the canvas */
+  .deck-tooltip{
+    pointer-events: auto !important;
+    z-index: 99999 !important;
+    /* Pull the tooltip under the cursor so you can click without moving */
+    margin: -24px 0 0 -24px; /* tweak -16..-32px as you like */
+  }
+  .deck-tooltip a{
+    pointer-events: auto !important;
+    display: block;
+    width: 100%;
+    height: 100%;  /* make the whole tooltip clickable */
+    cursor: pointer;
+  }
+</style>
+""", unsafe_allow_html=True)
+
+
+
+tooltip_html = (
+    """
+<a href="{sv_url}" target="_blank" rel="noopener noreferrer"
+   style="display:block; text-decoration:none; color:inherit;">
+  <div style="width:{POPUP_W}px">
+    <div style="font-weight:600;margin-bottom:6px;">Open Street View ↗</div>
+    <div><b>Row ID:</b> {row_id}</div>
+    <div><b>Pole:</b> {pole_id}</div>
+    <div><b>Rail incl:</b> {rail_incl_str}°</div>
+    <div><b>Misplacement:</b> {mispl_str} m</div>
+"""
+    + (
+        f"""    <div style="margin-top:6px">
+      <img src="{{fwd_path}}" style="width:100%; max-height:{IMG_MAX_H}px;object-fit:contain;border:1px solid #ccc;border-radius:6px"/>
+    </div>"""
+        if show_img
+        else ""
+    )
+    + """
+  </div>
+</a>
+"""
+)
+
+
+# Invisible, larger picking layer (so hover doesn't flicker if you twitch the mouse)
+hover_layer = pdk.Layer(
+    "ScatterplotLayer",
+    data=to_render,
+    get_position='[lon, lat]',
+    get_radius=32,            # big-ish hover/tap target (in pixels)
+    radius_units="pixels",
+    get_fill_color=[100, 0, 0, 0.1],  # fully transparent
+    opacity=0.5,                # not visible
+    pickable=True,            # used only for picking + tooltip
+    stroked=False,
+)
+
+# Your tiny, visible dots — not pickable (tooltip comes from hover_layer)
+scatter = pdk.Layer(
+    "ScatterplotLayer",
+    data=to_render,
+    get_position='[lon, lat]',
+    get_fill_color="rgb",
+    opacity=0.8,
+    pickable=False,           # <-- turn off here
+    auto_highlight=True,
+    stroked=False,
+    radius_units="pixels",
+    get_radius=3,             # tiny visual dot
+    radius_min_pixels=1,
+    radius_max_pixels=12,
+)
+
+deck = pdk.Deck(
+    layers=[hover_layer, scatter],  # invisible picker first
+    initial_view_state=view_state,
+    tooltip={
+        "html": tooltip_html,
+        "style": {
+            "pointerEvents": "auto",       # allow click on the tooltip itself
+            "backgroundColor": "rgba(255,255,255,0.96)",
+            "color": "black",
+        },
+    },
+)
+
+
+st.pydeck_chart(deck, use_container_width=True, height=600)
+
+# ---------------------- Editing panel ----------------------
 st.subheader("✏️ Edit selected measurement (writes to diff file, original data untouched)")
-
 col_sel, col_info = st.columns([1, 2], vertical_alignment="top")
 
 with col_sel:
     min_id = int(df["row_id"].min())
     max_id = int(df["row_id"].max())
+    # pydeck can't push click → Python; use the Row ID shown in tooltip
     default_start = int(st.session_state.selected_row_id) if st.session_state.selected_row_id is not None else min_id
 
     start_id = st.number_input(
         "Start Row ID",
         min_value=min_id, max_value=max_id,
         value=default_start, step=1,
-        help="Click a marker to fill this, or type manually.",
+        help="Use the Row ID visible in the tooltip.",
         key="row_start",
     )
     end_id = st.number_input(
@@ -225,13 +259,11 @@ with col_sel:
         s, e = e, s
     all_ids = set(df["row_id"].astype(int).tolist())
     target_ids = [rid for rid in range(s, e + 1) if rid in all_ids]
-
     row_exists = len(target_ids) > 0
 
 with col_info:
     if not row_exists:
         st.info("No valid rows in the selected range. Adjust Start/End.")
-        row_for_preview = None
     else:
         if len(target_ids) == 1:
             row_for_preview = df.loc[df["row_id"] == target_ids[0]].iloc[0]
@@ -240,14 +272,13 @@ with col_info:
                 f"**Lat/Lon:** {row_for_preview['lat']:.6f}, {row_for_preview['lon']:.6f} &nbsp;&nbsp; "
                 f"**Hour:** {int(row_for_preview['hour']) if pd.notna(row_for_preview['hour']) else '—'}"
             )
-            st.markdown("**Current values:** "
-                        f"Rail incl (corr): `{row_for_preview['rail_incl_corrected']}` &nbsp;&nbsp; "
-                        f"Misplacement: `{row_for_preview['misplacement']}`")
-        else:
-            row_for_preview = None
             st.markdown(
-                f"**Range selected:** **{s}–{e}** → **{len(target_ids)}** rows will be updated."
+                "**Current values:** "
+                f"Rail incl (corr): `{row_for_preview['rail_incl_corrected']}` &nbsp;&nbsp; "
+                f"Misplacement: `{row_for_preview['misplacement']}`"
             )
+        else:
+            st.markdown(f"**Range selected:** **{s}–{e}** → **{len(target_ids)}** rows will be updated.")
 
         with st.form(key="edit_form", clear_on_submit=False):
             st.write("Set new values (leave blank to skip). Check 'NaN' to clear a value for all rows in range.")
@@ -287,8 +318,7 @@ with col_info:
                                 })
                     st.success(f"Queued changes for **{len(target_ids)}** row(s). Use Download to save to file.")
 
-
-# ----- Diff review & download -----
+# ---------------------- Diff review & download ----------------------
 st.divider()
 st.subheader("📝 Pending edits (not applied to original data)")
 
@@ -317,7 +347,7 @@ else:
             data=csv_bytes,
             file_name="edits.csv",
             mime="text/csv",
-            width="stretch",
+            use_container_width=True,
             key="dl_csv",
         )
     with cdl2:
@@ -326,7 +356,7 @@ else:
             data=jsonl_bytes,
             file_name="edits.jsonl",
             mime="application/json",
-            width="stretch",
+            use_container_width=True,
             key="dl_jsonl",
         )
     with clr:
